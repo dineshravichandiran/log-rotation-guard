@@ -1,0 +1,6 @@
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends logrotate bash coreutils findutils && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/log-rotation-guard
+COPY . .
+RUN chmod +x bin/log-rotation-guard tests/run-tests.sh
+CMD ["bash"]

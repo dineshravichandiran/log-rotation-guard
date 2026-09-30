@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+#
+# log-rotation-guard - audit Linux log files for unbounded growth from a
+# missing or non-firing logrotate policy, and optionally generate + apply
+# a fix.
+#
+# The failure mode this targets: an application logging to a file inside
+# its own filesystem instead of to stdout/syslog. Nothing rotates it by
+# default, and it's easy for that to go unnoticed until a disk-full
+# incident. This tool finds those files before that happens.
+#
+# Report-only by default. --fix only ever writes a proposed logrotate
+# config path (never touches /etc directly with a hardcoded path); actually
+# executing it requires --apply.
+#
+# Exit codes (Nagios convention): 0 OK  1 WARNING  2 CRITICAL  3 UNKNOWN
+#
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# shellcheck source=../lib/common.sh
+source "${ROOT_DIR}/lib/common.sh" || { echo "cannot source lib/common.sh" >&2; exit 3; }
+# shellcheck source=../lib/checks.sh
+source "${ROOT_DIR}/lib/checks.sh" || die "cannot source lib/checks.sh"
+
+MODE="audit"
+FIX_PATH=""
+APPLY=false
+JSON=false
+
+usage() {
+  cat <<'EOF'
+Usage:
+  log-rotation-guard [--conf FILE]
+      Audit all configured log paths. Default action.
+
+  log-rotation-guard --fix PATH [--rotate N] [--size-mb N] [--apply]
+      Print a logrotate policy for PATH. With --apply, write it to
+      /etc/logrotate.d/ and force an immediate rotation to prove it works.
+
+Options:
+  --conf FILE     Use this config instead of conf/toolkit.conf
+  --rotate N      Rotated copies to keep in --fix mode (default 5)
+  --size-mb N     Rotation size threshold in --fix mode (default 100)
+  --apply         Actually write and run the generated policy (--fix only)
+  --json          Emit a one-line JSON summary alongside the text report
+  -h, --help      Show this help
+EOF
+}
+
+ROTATE_COUNT=5
+FIX_SIZE_MB=100
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --conf)      CONF_OVERRIDE="${2:-}"; [[ -z "$CONF_OVERRIDE" ]] && die "--conf needs a path"; shift 2 ;;
+    --fix)       MODE="fix"; FIX_PATH="${2:-}"; [[ -z "$FIX_PATH" ]] && die "--fix needs a path"; shift 2 ;;
+    --rotate)    ROTATE_COUNT="${2:-}"; shift 2 ;;
+    --size-mb)   FIX_SIZE_MB="${2:-}"; shift 2 ;;
+    --apply)     APPLY=true; shift ;;
+    --json)      JSON=true; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           die "unknown option: $1 (try --help)" ;;
+  esac
+done
+
+CONF="${CONF_OVERRIDE:-${ROOT_DIR}/conf/toolkit.conf}"
+if [[ -f "$CONF" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONF"
+else
+  LOG_PATHS="${LOG_PATHS:-}"
+  LOGROTATE_CONF_DIRS="${LOGROTATE_CONF_DIRS:-/etc/logrotate.d}"
+  WARN_MB="${WARN_MB:-100}"
+  CRIT_MB="${CRIT_MB:-500}"
+  STALE_DAYS="${STALE_DAYS:-30}"
+fi
+
+if [[ "$MODE" == "fix" ]]; then
+  section "Proposed logrotate policy for $FIX_PATH"
+  policy="$(generate_logrotate_conf "$FIX_PATH" "$ROTATE_COUNT" "$FIX_SIZE_MB")"
+  echo "$policy"
+
+  if [[ "$APPLY" == "true" ]]; then
+    base_name="$(basename "$FIX_PATH")"
+    conf_name="log-rotation-guard-$(printf '%s' "$base_name" | tr -c 'a-zA-Z0-9' '-')"
+    conf_target="/etc/logrotate.d/${conf_name}"
+    echo "$policy" > "$conf_target" || die "could not write $conf_target (need root?)"
+    printf '%swrote %s%s\n' "$C_DIM" "$conf_target" "$C_RESET"
+
+    logrotate -f "$conf_target" || die "logrotate -f failed"
+    if has_recent_rotated_sibling "$FIX_PATH" 1; then
+      report "$STATUS_OK" "$FIX_PATH" "forced rotation succeeded, rotated file confirmed on disk"
+    else
+      report "$STATUS_CRIT" "$FIX_PATH" "logrotate ran but no rotated file appeared"
+    fi
+    print_summary
+    exit "$WORST_STATUS"
+  fi
+  exit 0
+fi
+
+# --- audit mode --------------------------------------------------------
+printf '%slog-rotation-guard%s  |  %s  |  %s\n' "$C_BOLD" "$C_RESET" "$(hostname)" "$(log_ts)"
+
+if [[ -z "${LOG_PATHS// /}" ]]; then
+  die "no LOG_PATHS configured — set it in conf/toolkit.conf or export it"
+fi
+
+# LOGROTATE_CONF_DIRS is space-separated in config for readability.
+read -r -a conf_dirs <<< "$LOGROTATE_CONF_DIRS"
+
+section "Log paths"
+for path in $LOG_PATHS; do
+  check_log_path "$path" "$WARN_MB" "$CRIT_MB" "$STALE_DAYS" "${conf_dirs[@]}"
+done
+
+print_summary
+
+if [[ "$JSON" == "true" ]]; then
+  printf '{"checks_run":%d,"ok":%d,"warning":%d,"critical":%d,"worst_status":%d}\n' \
+    "$CHECKS_RUN" "$CHECKS_OK" "$CHECKS_WARN" "$CHECKS_CRIT" "$WORST_STATUS"
+fi
+
+exit "$WORST_STATUS"

@@ -1,0 +1,16 @@
+# Copy to conf/toolkit.conf and edit for your host.
+# Space-separated lists; use absolute paths.
+
+# Log files to audit for rotation coverage.
+LOG_PATHS="/var/log/app/app.log /var/log/nginx/access.log"
+
+# Directories to search for existing logrotate policies.
+LOGROTATE_CONF_DIRS="/etc/logrotate.d /etc/logrotate.conf"
+
+# Size thresholds in MB.
+WARN_MB=100
+CRIT_MB=500
+
+# A rotated sibling older than this is treated as stale (rotation may have
+# stopped firing even though a policy exists).
+STALE_DAYS=30
